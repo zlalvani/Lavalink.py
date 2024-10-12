@@ -29,6 +29,7 @@ from collections import defaultdict
 from inspect import getmembers, ismethod
 from typing import (Any, Callable, Coroutine, Dict, Generic, List, Optional, Sequence, Set, Tuple,
                     Type, TypeVar, Union)
+import warnings
 
 import aiohttp
 
@@ -44,6 +45,34 @@ _log = logging.getLogger(__name__)
 
 PlayerT = TypeVar('PlayerT', bound=BasePlayer)
 EventT = TypeVar('EventT', bound=Event)
+
+
+# Copied from hikari.internal.aio
+def _get_or_make_loop() -> asyncio.AbstractEventLoop:
+    """Get the current usable event loop or create a new one.
+
+    Returns
+    -------
+    asyncio.AbstractEventLoop
+        The requested loop.
+    """
+    # get_event_loop will error under oddly specific cases such as if set_event_loop has been called before even
+    # if it was just called with None or if it's called on a thread which isn't the main Thread.
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            loop = asyncio.get_event_loop_policy().get_event_loop()
+
+        # Closed loops cannot be re-used.
+        if not loop.is_closed():
+            return loop
+
+    except RuntimeError:
+        pass
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    return loop
 
 
 class Client(Generic[PlayerT]):
@@ -100,7 +129,9 @@ class Client(Generic[PlayerT]):
                             'ensure your bot has fired "on_ready" before instantiating '
                             'the Lavalink client. Alternatively, you can hardcode your user ID.')
 
-        self._session = aiohttp.ClientSession(timeout=request_timeout)
+        loop = _get_or_make_loop()
+
+        self._session = aiohttp.ClientSession(timeout=request_timeout, loop=loop)
         self._user_id = int(user_id)
         self._event_hooks = defaultdict(list)
         self.node_manager: NodeManager = NodeManager(self, regions, connect_back)
