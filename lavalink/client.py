@@ -23,12 +23,11 @@ SOFTWARE.
 """
 import asyncio
 import inspect
-import itertools
 import logging
 import random
 from collections import defaultdict
 from inspect import getmembers, ismethod
-from typing import (Any, Callable, Dict, Generic, List, Optional, Sequence, Set, Tuple,
+from typing import (Any, Callable, Coroutine, Dict, Generic, List, Optional, Sequence, Set, Tuple,
                     Type, TypeVar, Union)
 
 import aiohttp
@@ -78,6 +77,8 @@ class Client(Generic[PlayerT]):
         the player was moved via the failover mechanism, the player will still move back to the original
         node when it becomes available. This behaviour can be avoided in custom player implementations by
         setting ``self._original_node`` to ``None`` in the :func:`BasePlayer.change_node` function.
+    request_timeout: Optional[:class:`aiohttp.ClientTimeout`]
+        A ``ClientTimeout`` object to be used for requests. If unspecified, defaults will be used.
 
     Attributes
     ----------
@@ -91,15 +92,16 @@ class Client(Generic[PlayerT]):
     __slots__ = ('_session', '_user_id', '_event_hooks', 'node_manager', 'player_manager', 'sources')
 
     def __init__(self, user_id: Union[int, str], player: Type[PlayerT] = DefaultPlayer,
-                 regions: Optional[Dict[str, Tuple[str]]] = None, connect_back: bool = False):
+                 regions: Optional[Dict[str, Tuple[str]]] = None, connect_back: bool = False,
+                 request_timeout: Optional[aiohttp.ClientTimeout] = None):
         if not isinstance(user_id, (str, int)) or isinstance(user_id, bool):
             # bool has special handling because it subclasses `int`, so will return True for the first isinstance check.
             raise TypeError(f'user_id must be either an int or str (not {type(user_id).__name__}). If the type is None, '
                             'ensure your bot has fired "on_ready" before instantiating '
                             'the Lavalink client. Alternatively, you can hardcode your user ID.')
 
-        self._session: aiohttp.ClientSession = aiohttp.ClientSession()
-        self._user_id: int = int(user_id)
+        self._session = aiohttp.ClientSession(timeout=request_timeout)
+        self._user_id = int(user_id)
         self._event_hooks = defaultdict(list)
         self.node_manager: NodeManager = NodeManager(self, regions, connect_back)
         self.player_manager: PlayerManager[PlayerT] = PlayerManager(self, player)
@@ -161,7 +163,7 @@ class Client(Generic[PlayerT]):
             if hook not in event_hooks:
                 event_hooks.append(hook)
 
-    def add_event_hooks(self, cls: Any):  # TODO: I don't think Any is the correct type here...
+    def add_event_hooks(self, cls: object):
         """
         Scans the provided class ``cls`` for functions decorated with :func:`listener`,
         and sets them up to process Lavalink events.
@@ -182,7 +184,7 @@ class Client(Generic[PlayerT]):
 
         Parameters
         ----------
-        cls: Any
+        cls: object
             An instance of a class containing event hook methods.
         """
         methods = getmembers(cls, predicate=lambda meth: hasattr(meth, '__name__')
@@ -199,7 +201,7 @@ class Client(Generic[PlayerT]):
             else:
                 self._event_hooks['Generic'].append(listener)
 
-    def remove_event_hooks(self, *, events: Optional[Sequence[EventT]] = None, hooks: Sequence[Callable]):
+    def remove_event_hooks(self, *, events: Optional[Sequence[Type[EventT]]] = None, hooks: Sequence[Callable]):
         """
         Removes the given hooks from the event hook registry.
 
@@ -447,9 +449,8 @@ class Client(Generic[PlayerT]):
         """
         return len(self._event_hooks['Generic']) > 0 or len(self._event_hooks[event.__name__]) > 0
 
-    async def _dispatch_event(self, event: Event):
-        """|coro|
-
+    def _dispatch_event(self, event: Event):
+        """
         Dispatches the given event to all registered hooks.
 
         Parameters
@@ -463,15 +464,21 @@ class Client(Generic[PlayerT]):
         if not generic_hooks and not targeted_hooks:
             return
 
+        hooks = generic_hooks + targeted_hooks
+        loop = asyncio.get_event_loop()
+        loop.create_task(self.__real_dispatch(event, hooks))
+
+    async def __real_dispatch(self, event: Event, hooks: List[Callable[[Event], Coroutine[Any, Any, Any]]]):
         async def _hook_wrapper(hook, event):
             try:
                 await hook(event)
+            except asyncio.CancelledError:
+                _log.debug('Event hook \'%s\' dispatch was cancelled.', hook.__name__)
             except:  # noqa: E722 pylint: disable=bare-except
                 _log.exception('Event hook \'%s\' encountered an exception!', hook.__name__)
 
-        tasks = [_hook_wrapper(hook, event) for hook in itertools.chain(generic_hooks, targeted_hooks)]
+        tasks = [_hook_wrapper(hook, event) for hook in hooks]
         await asyncio.gather(*tasks)
-
         _log.debug('Dispatched \'%s\' to all registered hooks', type(event).__name__)
 
     def __repr__(self):
